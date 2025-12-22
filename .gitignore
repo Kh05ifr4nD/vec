@@ -1,0 +1,9 @@
+# Kernel module build outputs (sgxvec)
+kernel_module/*.o
+kernel_module/*.ko
+kernel_module/*.mod
+kernel_module/*.mod.c
+kernel_module/*.mod.o
+kernel_module/.*.cmd
+kernel_module/Module.symvers
+kernel_module/modules.order

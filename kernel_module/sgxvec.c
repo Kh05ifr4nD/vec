@@ -1,92 +1,177 @@
+#include <linux/capability.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/unistd.h>
-#include <asm/io.h>
-#include <linux/sched.h>
-#include <linux/fs.h>
+#include <linux/mutex.h>
 #include <linux/proc_fs.h>
-#include <asm/uaccess.h>
-#include <asm/unistd.h>
+#include <linux/smp.h>
 #include <linux/types.h>
-#include <asm/cacheflush.h>
-#include <asm/cpufeature.h>
+#include <linux/uaccess.h>
+#include <linux/version.h>
 
-#ifndef __KERNEL__
-#define __KERNEL__
+#include <asm/apic.h>
+
+#define SGXVEC_DISABLE_APIC_CMD 0
+#define SGXVEC_ENABLE_APIC_CMD 1
+#define SGXVEC_RESET_ALL_CMD 2
+
+struct sgxvec_cmd {
+  int mode;
+  int cpuid;
+};
+
+static DEFINE_MUTEX(g_sgxvec_lock);
+static DECLARE_BITMAP(g_apic_disabled_mask, NR_CPUS);
+
+static void sgxvec_disable_apic(void *info) {
+  unsigned int v;
+  if (apic_is_x2apic_enabled()) {
+#ifdef CONFIG_X86_X2APIC
+    v = native_apic_msr_read(APIC_SPIV);
+#else
+    return;
 #endif
-
-struct task_struct* task;
-
-#define DISABLE_APIC_CMD 0
-#define ENABLE_APIC_CMD 1
-
-typedef struct sgx_cat_cmd {
-    int mode;
-    int cpuid;
-} sgx_cat_cmd;
-
-void vec_disable_apic(void * info) {
-  unsigned int v;
-  v = apic_read(APIC_SPIV);
+  } else {
+    v = native_apic_mem_read(APIC_SPIV);
+  }
   v &= ~(APIC_SPIV_APIC_ENABLED);
-  apic_write(APIC_SPIV, v);
+  if (apic_is_x2apic_enabled()) {
+#ifdef CONFIG_X86_X2APIC
+    native_apic_msr_write(APIC_SPIV, v);
+#endif
+  } else {
+    native_apic_mem_write(APIC_SPIV, v);
+  }
 }
 
-void vec_enable_apic(void * info) {
+static void sgxvec_enable_apic(void *info) {
   unsigned int v;
-  v = apic_read(APIC_SPIV);
+  if (apic_is_x2apic_enabled()) {
+#ifdef CONFIG_X86_X2APIC
+    v = native_apic_msr_read(APIC_SPIV);
+#else
+    return;
+#endif
+  } else {
+    v = native_apic_mem_read(APIC_SPIV);
+  }
   v |= (APIC_SPIV_APIC_ENABLED);
-  apic_write(APIC_SPIV, v);
+  if (apic_is_x2apic_enabled()) {
+#ifdef CONFIG_X86_X2APIC
+    native_apic_msr_write(APIC_SPIV, v);
+#endif
+  } else {
+    native_apic_mem_write(APIC_SPIV, v);
+  }
 }
 
-ssize_t my_proc_write(struct file *file, const char __user *buffer, size_t count, loff_t *data)
-{
-  sgx_cat_cmd buf;
-  if (count != sizeof(sgx_cat_cmd))
+static void sgxvec_enable_apic_all(void) {
+  int cpu;
+  for_each_online_cpu(cpu) {
+    if (test_bit(cpu, g_apic_disabled_mask)) {
+      (void)smp_call_function_single(cpu, sgxvec_enable_apic, NULL, 1);
+      clear_bit(cpu, g_apic_disabled_mask);
+    }
+  }
+}
+
+static ssize_t sgxvec_proc_write(struct file *file, const char __user *buffer,
+                                 size_t count, loff_t *ppos) {
+  struct sgxvec_cmd cmd;
+  int rc;
+
+  (void)file;
+  (void)ppos;
+
+  if (!capable(CAP_SYS_ADMIN)) {
+    return -EPERM;
+  }
+  if (count != sizeof(cmd)) {
     return -EINVAL;
-  if (copy_from_user(&buf, buffer, count)) {
+  }
+  if (copy_from_user(&cmd, buffer, sizeof(cmd))) {
     return -EFAULT;
   }
-  printk("SGXVEC mode %d cpuid %d, run on core %d\n", buf.mode, buf.cpuid, smp_processor_id());
-  task = current;
-  switch(buf.mode) {
-    case (DISABLE_APIC_CMD):
-      smp_call_function_single(buf.cpuid, vec_disable_apic, 0, 1);
+
+  mutex_lock(&g_sgxvec_lock);
+  switch (cmd.mode) {
+  case SGXVEC_DISABLE_APIC_CMD:
+    if (cmd.cpuid < 0 || cmd.cpuid >= nr_cpu_ids) {
+      rc = -EINVAL;
       break;
-    case (ENABLE_APIC_CMD):
-      smp_call_function_single(buf.cpuid, vec_enable_apic, 0, 1);
+    }
+    if (!cpu_online(cmd.cpuid)) {
+      rc = -EINVAL;
       break;
-    default:
-      printk("[!]Unknown instruction.\n");
+    }
+    rc = smp_call_function_single(cmd.cpuid, sgxvec_disable_apic, NULL, 1);
+    if (!rc) {
+      set_bit(cmd.cpuid, g_apic_disabled_mask);
+    }
+    break;
+  case SGXVEC_ENABLE_APIC_CMD:
+    if (cmd.cpuid < 0 || cmd.cpuid >= nr_cpu_ids) {
+      rc = -EINVAL;
       break;
+    }
+    if (!cpu_online(cmd.cpuid)) {
+      rc = -EINVAL;
+      break;
+    }
+    rc = smp_call_function_single(cmd.cpuid, sgxvec_enable_apic, NULL, 1);
+    if (!rc) {
+      clear_bit(cmd.cpuid, g_apic_disabled_mask);
+    }
+    break;
+  case SGXVEC_RESET_ALL_CMD:
+    sgxvec_enable_apic_all();
+    rc = 0;
+    break;
+  default:
+    rc = -EINVAL;
+    break;
   }
-  return count;
+  mutex_unlock(&g_sgxvec_lock);
+
+  if (rc) {
+    return rc;
+  }
+  return (ssize_t)count;
 }
 
-int __init init_SGXVEC(void)
-{
-  struct proc_dir_entry *my_proc_file = NULL;
-
-  static const struct file_operations my_proc_fops = {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
+static const struct proc_ops sgxvec_proc_ops = {
+    .proc_write = sgxvec_proc_write,
+};
+#else
+static const struct file_operations sgxvec_proc_ops = {
     .owner = THIS_MODULE,
-    .write = my_proc_write,
-  };
-  my_proc_file = proc_create("sgxvec", S_IRUSR |S_IWUSR | S_IRGRP | S_IROTH |  S_IWOTH, NULL, &my_proc_fops);
-  if(my_proc_file == NULL)
-    return -ENOMEM;
+    .write = sgxvec_proc_write,
+};
+#endif
 
-  printk("SGXVEC Module Init.\n");
+static int __init sgxvec_init(void) {
+  struct proc_dir_entry *ent;
+
+  ent = proc_create("sgxvec", 0666, NULL, &sgxvec_proc_ops);
+  if (!ent) {
+    return -ENOMEM;
+  }
+
+  pr_info("sgxvec: loaded (/proc/sgxvec)\n");
   return 0;
 }
 
-void __exit exit_SGXVEC(void)
-{
+static void __exit sgxvec_exit(void) {
+  mutex_lock(&g_sgxvec_lock);
+  sgxvec_enable_apic_all();
+  mutex_unlock(&g_sgxvec_lock);
+
   remove_proc_entry("sgxvec", NULL);
-  printk("SGXVEC Module Exit.\n");
+  pr_info("sgxvec: unloaded\n");
 }
 
-module_init(init_SGXVEC);
-module_exit(exit_SGXVEC);
+module_init(sgxvec_init);
+module_exit(sgxvec_exit);
 
 MODULE_LICENSE("GPL v2");
-MODULE_DESCRIPTION("A kernel module: SGXVEC");
+MODULE_DESCRIPTION("SGXVEC: local APIC control for IFEW experiments");
